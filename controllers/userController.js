@@ -1,199 +1,403 @@
-const jwt = require('jsonwebtoken');
 const User = require('../models/User');
-const { scrapeLinkedIn } = require('../services/scrapeLinkedIn');
-const { enrichProfile, generateEmbedding } = require('../services/openaiService');
+const jwt = require('jsonwebtoken');
+const { scrapeLinkedIn } = require('../services/linkedinService');
+const { enrichProfile } = require('../services/openaiService');
 
-// Generate JWT Token
-const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+/**
+ * Generate JWT token
+ */
+const generateToken = (userId) => {
+  return jwt.sign({ id: userId }, process.env.JWT_SECRET, {
+    expiresIn: '30d'
+  });
 };
 
-// Protect routes middleware
-const protect = async (req, res, next) => {
-  let token;
-
-  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+/**
+ * Ensure array format with safe defaults
+ */
+const ensureArray = (value) => {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
     try {
-      token = req.headers.authorization.split(' ')[1];
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      req.user = await User.findById(decoded.id).select('-password');
-      next();
-    } catch (error) {
-      return res.status(401).json({ error: 'Not authorized, token failed' });
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      // If it's a comma-separated string
+      return value.split(',').map(item => item.trim()).filter(Boolean);
     }
   }
-
-  if (!token) {
-    return res.status(401).json({ error: 'Not authorized, no token' });
-  }
+  return [];
 };
 
-// @route   POST /api/register
-// @desc    Register new user with AI enrichment
-// @access  Public
+/**
+ * Merge arrays without duplicates
+ */
+const mergeArrays = (...arrays) => {
+  const merged = arrays.flat().filter(Boolean);
+  return [...new Set(merged)];
+};
+
+/**
+ * @route   POST /api/auth/register
+ * @desc    Register new user with LinkedIn scraping and AI enrichment
+ * @access  Public
+ */
 const register = async (req, res) => {
   try {
-    const { name, email, password, bio, skills, interests, linkedinURL } = req.body;
+    const {
+      name,
+      email,
+      password,
+      bio,
+      skills,
+      interests,
+      linkedinURL,
+      role,
+      businessType,
+      industry,
+      location
+    } = req.body;
 
-    // Validate required fields
+    // Validation
     if (!name || !email || !password) {
-      return res.status(400).json({ error: 'Please provide name, email, and password' });
+      return res.status(400).json({
+        success: false,
+        error: 'Please provide name, email, and password'
+      });
     }
 
-    // Check if user exists
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        error: 'Password must be at least 6 characters'
+      });
+    }
+
+    // Check existing user
     const userExists = await User.findOne({ email });
     if (userExists) {
-      return res.status(400).json({ error: 'User already exists' });
+      return res.status(400).json({
+        success: false,
+        error: 'Email already registered'
+      });
     }
 
-    // Create initial user object
+    console.log(`\n📝 Registration started for: ${name} (${email})`);
+
+    // Initialize user data with safe defaults
     let userData = {
       name,
       email,
       password,
       bio: bio || '',
-      skills: skills || [],
-      interests: interests || [],
+      skills: ensureArray(skills),
+      interests: ensureArray(interests),
+      education: [],
+      experience: [],
       linkedinURL: linkedinURL || '',
-      collaborationTargets: '' || [],
+      role: role || '',
+      businessType: businessType || '',
+      industry: industry || '',
+      location: location || '',
+      linkedinSummary: {}
     };
 
-    // Step 1: Scrape LinkedIn if URL provided
-    if (linkedinURL) {
-      console.log('🔍 Scraping LinkedIn profile...');
+    // STEP 1: Scrape LinkedIn if provided
+    let linkedinData = null;
+    if (linkedinURL && linkedinURL.trim()) {
+      console.log(`🔍 Step 1: Scraping LinkedIn profile...`);
       try {
-        const linkedinData = await scrapeLinkedIn(linkedinURL);
-        userData.linkedinData = linkedinData;
+        linkedinData = await scrapeLinkedIn(linkedinURL.trim());
         
-        // Merge LinkedIn data into profile
-        if (linkedinData.about && !userData.bio) {
-          userData.bio = linkedinData.about;
-        }
-        if (linkedinData.skills && linkedinData.skills.length > 0) {
-          userData.skills = [...new Set([...userData.skills, ...linkedinData.skills])];
+        if (linkedinData) {
+          userData.linkedinSummary = linkedinData;
+
+          // Merge LinkedIn data with user input (user input takes priority)
+          userData.bio = userData.bio || linkedinData.about || '';
+          userData.role = userData.role || linkedinData.title || linkedinData.headline || '';
+          userData.industry = userData.industry || linkedinData.industry || '';
+          userData.location = userData.location || linkedinData.location || '';
+          
+          // Merge arrays
+          userData.skills = mergeArrays(userData.skills, linkedinData.skills);
+          userData.interests = mergeArrays(userData.interests, linkedinData.interests);
+          userData.education = linkedinData.education || [];
+          userData.experience = linkedinData.experience || [];
+
+          console.log(`✅ LinkedIn data merged:`, {
+            skills: userData.skills.length,
+            interests: userData.interests.length,
+            education: userData.education.length,
+            experience: userData.experience.length
+          });
+        } else {
+          console.log(`⚠️  LinkedIn scraping returned no data`);
         }
       } catch (error) {
-        console.log('⚠️  LinkedIn scraping failed:', error.message);
-        // Continue without LinkedIn data
+        console.log(`⚠️  LinkedIn scraping failed: ${error.message}`);
+        // Continue with registration even if LinkedIn scraping fails
       }
+    } else {
+      console.log(`⏭️  Step 1: Skipped (no LinkedIn URL provided)`);
     }
 
-    // Step 2: Enrich profile with OpenAI
-    console.log('🤖 Enriching profile with AI...');
+    // STEP 2: AI Profile Enrichment
+    console.log(`🤖 Step 2: Enriching profile with AI...`);
     try {
-      const enrichedData = await enrichProfile({
+      const aiInput = {
         name: userData.name,
         bio: userData.bio,
         skills: userData.skills,
         interests: userData.interests,
-        linkedinData: userData.linkedinData,
-        
-      });
+        role: userData.role,
+        industry: userData.industry,
+        businessType: userData.businessType,
+        location: userData.location,
+        education: userData.education,
+        linkedinSummary: userData.linkedinSummary
+      };
 
-      userData.enrichedBio = enrichedData.enrichedBio;
-      userData.enrichedSkills = enrichedData.enrichedSkills;
-      userData.industry = enrichedData.industry;
-      userData.location = enrichedData.location;
-      userData.collaborationTargets = enrichedData.collaborationTargets;
+      const enrichedData = await enrichProfile(aiInput);
+
+      // Apply enriched data (preserve user input where it exists)
+      userData.enrichedBio = enrichedData.enrichedBio || userData.bio;
+      userData.enrichedSkills = enrichedData.enrichedSkills.length > 0 
+        ? enrichedData.enrichedSkills 
+        : userData.skills;
+      userData.role = enrichedData.role || userData.role;
+      userData.industry = enrichedData.industry || userData.industry;
+      userData.businessType = enrichedData.businessType || userData.businessType;
+      userData.location = enrichedData.location || userData.location;
+      userData.interests = mergeArrays(userData.interests, enrichedData.analyzedInterests);
+      userData.collaborationTargets = enrichedData.collaborationTargets || [];
+      userData.profileEnrichedAt = new Date();
+
+      console.log(`✅ Profile enriched successfully:`, {
+        enrichedSkills: userData.enrichedSkills.length,
+        collaborationTargets: userData.collaborationTargets.length,
+        topTargets: userData.collaborationTargets.slice(0, 3).map(t => ({
+          type: t.type,
+          priority: t.priority
+        }))
+      });
     } catch (error) {
-      console.log('⚠️  Profile enrichment failed:', error.message);
-      // Continue with basic data
+      console.error(`❌ Profile enrichment failed:`, error.message);
+      // Use original data as fallbacks
       userData.enrichedBio = userData.bio;
       userData.enrichedSkills = userData.skills;
-      userData.collaborationTargets = "Failed";
-
+      userData.collaborationTargets = [];
     }
 
-    // Step 3: Generate embedding
-    console.log('🧠 Generating profile embedding...');
-    try {
-      const profileText = `${userData.name}. ${userData.enrichedBio}. Skills: ${userData.enrichedSkills.join(', ')}. Interests: ${userData.interests.join(', ')}. Industry: ${userData.industry || 'General'}, collaborationTargets: ${userData.collaborationTargets.join(', ')}`;
-      const embedding = await generateEmbedding(profileText);
-      userData.embedding = embedding;
-    } catch (error) {
-      console.log('⚠️  Embedding generation failed:', error.message);
-      userData.embedding = [];
-    }
+    // STEP 3: Create user in database
+    console.log(`💾 Step 3: Creating user in database...`);
 
-    // Create user
     const user = await User.create(userData);
 
-    res.status(201).json({
-      _id: user._id,
+    console.log(`✅ User created successfully:`, {
+      id: user._id,
       name: user.name,
-      email: user.email,
-      bio: user.enrichedBio,
-      skills: user.enrichedSkills,
-      interests: user.interests,
+      role: user.role,
       industry: user.industry,
-      location: user.location,
-      collaborationTargets:userData.collaborationTargets,
-      token: generateToken(user._id)
+      collaborationTargets: user.collaborationTargets.length
+    });
+
+    // Generate token
+    const token = generateToken(user._id);
+
+    // Return response
+    res.status(201).json({
+      success: true,
+      message: 'Registration successful',
+      data: {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        bio: user.enrichedBio,
+        skills: user.enrichedSkills,
+        interests: user.interests,
+        role: user.role,
+        businessType: user.businessType,
+        industry: user.industry,
+        location: user.location,
+        collaborationTargets: user.collaborationTargets,
+        linkedinURL: user.linkedinURL,
+        profileEnriched: !!user.profileEnrichedAt,
+        createdAt: user.createdAt
+      },
+      token
     });
 
   } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({ error: 'Registration failed', message: error.message });
+    console.error('❌ Registration error:', error);
+    
+    // Handle mongoose validation errors
+    if (error.name === 'ValidationError') {
+      const messages = Object.values(error.errors).map(err => err.message);
+      return res.status(400).json({
+        success: false,
+        error: 'Validation error',
+        details: messages
+      });
+    }
+
+    // Handle duplicate key errors
+    if (error.code === 11000) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email already registered'
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'Registration failed',
+      message: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
   }
 };
 
-// @route   POST /api/login
-// @desc    Authenticate user
-// @access  Public
+/**
+ * @route   POST /api/auth/login
+ * @desc    Login user
+ * @access  Public
+ */
 const login = async (req, res) => {
   try {
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({ error: 'Please provide email and password' });
+      return res.status(400).json({
+        success: false,
+        error: 'Please provide email and password'
+      });
     }
 
-    const user = await User.findOne({ email });
+    // Find user (include password for verification)
+    const user = await User.findOne({ email }).select('+password');
 
-    if (user && (await user.comparePassword(password))) {
-      res.json({
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid credentials'
+      });
+    }
+
+    // Check password
+    const isMatch = await user.comparePassword(password);
+
+    if (!isMatch) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid credentials'
+      });
+    }
+
+    console.log(`✅ User logged in: ${user.name} (${user._id})`);
+
+    // Generate token
+    const token = generateToken(user._id);
+
+    res.json({
+      success: true,
+      message: 'Login successful',
+      data: {
         _id: user._id,
         name: user.name,
         email: user.email,
-        token: generateToken(user._id)
-      });
-    } else {
-      res.status(401).json({ error: 'Invalid email or password' });
-    }
+        bio: user.enrichedBio || user.bio,
+        skills: user.enrichedSkills || user.skills,
+        interests: user.interests,
+        role: user.role,
+        industry: user.industry,
+        businessType: user.businessType,
+        location: user.location,
+        collaborationTargets: user.collaborationTargets,
+        profileEnriched: !!user.profileEnrichedAt
+      },
+      token
+    });
+
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'Login failed', message: error.message });
+    console.error('❌ Login error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Login failed',
+      message: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
   }
 };
 
-// @route   GET /api/profile/:id
-// @desc    Get user profile
-// @access  Private
-const getProfile = async (req, res) => {
+/**
+ * @route   GET /api/auth/me
+ * @desc    Get current user profile
+ * @access  Private
+ */
+const getMe = async (req, res) => {
   try {
-    const user = await User.findById(req.params.id).select('-password -embedding');
+    const user = await User.findById(req.user.id);
 
     if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
     }
 
     res.json({
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      bio: user.enrichedBio || user.bio,
-      skills: user.enrichedSkills.length > 0 ? user.enrichedSkills : user.skills,
-      interests: user.interests,
-      industry: user.industry,
-      location: user.location,
-      linkedinURL: user.linkedinURL,
-      linkedinData: user.linkedinData,
-      createdAt: user.createdAt
+      success: true,
+      data: user.toSafeObject()
     });
   } catch (error) {
-    console.error('Get profile error:', error);
-    res.status(500).json({ error: 'Failed to fetch profile', message: error.message });
+    console.error('❌ Get profile error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch profile'
+    });
   }
 };
 
-module.exports = { register, login, getProfile, protect };
+/**
+ * @route   PUT /api/auth/profile
+ * @desc    Update user profile
+ * @access  Private
+ */
+const updateProfile = async (req, res) => {
+  try {
+    const allowedUpdates = [
+      'name', 'bio', 'skills', 'interests', 'role', 
+      'businessType', 'industry', 'location', 'linkedinURL'
+    ];
+    
+    const updates = {};
+    allowedUpdates.forEach(field => {
+      if (req.body[field] !== undefined) {
+        if (['skills', 'interests'].includes(field)) {
+          updates[field] = ensureArray(req.body[field]);
+        } else {
+          updates[field] = req.body[field];
+        }
+      }
+    });
+
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      updates,
+      { new: true, runValidators: true }
+    );
+
+    res.json({
+      success: true,
+      message: 'Profile updated successfully',
+      data: user.toSafeObject()
+    });
+  } catch (error) {
+    console.error('❌ Update profile error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update profile'
+    });
+  }
+};
+
+module.exports = { register, login, getMe, updateProfile };

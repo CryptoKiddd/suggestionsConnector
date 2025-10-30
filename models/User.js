@@ -17,7 +17,8 @@ const userSchema = new mongoose.Schema({
   password: {
     type: String,
     required: true,
-    minlength: 6
+    minlength: 6,
+    select: false // Don't return password by default
   },
   bio: {
     type: String,
@@ -27,39 +28,47 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
-  skills: [{
-    type: String,
-    trim: true
-  }],
-  enrichedSkills: [{
-    type: String,
-    trim: true
-  }],
-  interests: [{
-    type: String,
-    trim: true
-  }],
-  linkedinURL: {
+  skills: {
+    type: [String],
+    default: []
+  },
+  enrichedSkills: {
+    type: [String],
+    default: []
+  },
+  interests: {
+    type: [String],
+    default: []
+  },
+  education: {
+    type: [{
+      school: String,
+      degree: String,
+      fieldOfStudy: String,
+      startDate: String,
+      endDate: String
+    }],
+    default: []
+  },
+  experience: {
+    type: [{
+      title: String,
+      company: String,
+      location: String,
+      startDate: String,
+      endDate: String,
+      description: String
+    }],
+    default: []
+  },
+  role: {
     type: String,
     default: ''
   },
-  linkedinData: {
-    headline: String,
-    about: String,
-    experience: [{
-      title: String,
-      company: String,
-      duration: String
-    }],
-    education: [{
-      school: String,
-      degree: String
-    }],
-    skills: [String]
+  businessType: {
+    type: String,
+    default: ''
   },
-  embedding: [{
-    type: Number
-  }],
   industry: {
     type: String,
     default: ''
@@ -67,13 +76,84 @@ const userSchema = new mongoose.Schema({
   location: {
     type: String,
     default: ''
-  }
+  },
+  linkedinURL: {
+    type: String,
+    default: ''
+  },
+  linkedinSummary: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {}
+  },
+  collaborationTargets: [
+    {
+      type: {
+        type: String,
+        required: true
+      },
+      reason: {
+        type: String,
+        default: ''
+      },
+      potentialCollaboration: {
+        type: String,
+        default: ''
+      },
+      keywords: {
+        type: [String],
+        default: []
+      },
+      industries: {
+        type: [String],
+        default: []
+      },
+      roles: {
+        type: [String],
+        default: []
+      },
+      mutualBenefit: {
+        type: String,
+        default: ''
+      },
+      priority: {
+        type: Number,
+        default: 0,
+        min: 0,
+        max: 10
+      }
+    }
+  ],
+  profileEnrichedAt: {
+    type: Date,
+    default: null
+  },
+  connections: [
+    {
+      userId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User'
+      },
+      status: {
+        type: String,
+        enum: ['pending', 'accepted', 'rejected'],
+        default: 'pending'
+      },
+      connectedAt: Date
+    }
+  ]
 }, {
   timestamps: true
 });
 
+// Indexes for better query performance
+userSchema.index({ email: 1 });
+userSchema.index({ 'collaborationTargets.keywords': 1 });
+userSchema.index({ 'collaborationTargets.industries': 1 });
+userSchema.index({ 'collaborationTargets.roles': 1 });
+userSchema.index({ industry: 1, role: 1 });
+
 // Hash password before saving
-userSchema.pre('save', async function(next) {
+userSchema.pre('save', async function (next) {
   if (!this.isModified('password')) {
     return next();
   }
@@ -83,8 +163,15 @@ userSchema.pre('save', async function(next) {
 });
 
 // Compare password method
-userSchema.methods.comparePassword = async function(candidatePassword) {
+userSchema.methods.comparePassword = async function (candidatePassword) {
   return await bcrypt.compare(candidatePassword, this.password);
+};
+
+// Method to get safe user data (without password)
+userSchema.methods.toSafeObject = function() {
+  const obj = this.toObject();
+  delete obj.password;
+  return obj;
 };
 
 module.exports = mongoose.model('User', userSchema);
