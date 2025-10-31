@@ -146,7 +146,7 @@ const userSchema = new mongoose.Schema({
 });
 
 // Indexes for better query performance
-userSchema.index({ email: 1 });
+
 userSchema.index({ 'collaborationTargets.keywords': 1 });
 userSchema.index({ 'collaborationTargets.industries': 1 });
 userSchema.index({ 'collaborationTargets.roles': 1 });
